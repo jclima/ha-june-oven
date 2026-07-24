@@ -1,0 +1,71 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "This June oven is already configured.",
+      "pairing_lost": "The pairing session was lost. Start again."
+    },
+    "error": {
+      "cannot_connect": "Could not connect to June's cloud. Check Home Assistant's internet connection and try again.",
+      "not_paired_yet": "The oven has not finished pairing. Enter the code on the oven, wait a few seconds, and try again.",
+      "pairing_failed": "The oven rejected or could not finish pairing. Confirm it is idle, closed, online, and try again."
+    },
+    "step": {
+      "pair": {
+        "description": "On the oven, open **Connect** and enter **{code}**. Wait for the oven to finish, then select Submit.",
+        "title": "Pair the oven"
+      },
+      "user": {
+        "data": {
+          "default_mode": "Default cook mode",
+          "default_temp_f": "Default temperature"
+        },
+        "description": "Home Assistant will create a private companion identity and pair directly with the oven. No June account login is needed.",
+        "title": "Set up June Oven"
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connected": {
+        "name": "Connectivity"
+      },
+      "done": {
+        "name": "Cook done"
+      },
+      "ready": {
+        "name": "Preheat ready"
+      }
+    },
+    "camera": {
+      "interior": {
+        "name": "Interior"
+      }
+    },
+    "climate": {
+      "oven": {
+        "name": null
+      }
+    },
+    "sensor": {
+      "probe_temperature": {
+        "name": "Food probe"
+      },
+      "progress": {
+        "name": "Cook progress"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "default_mode": "Default cook mode",
+          "default_temp_f": "Default temperature",
+          "device_name": "Oven name"
+        },
+        "description": "Choose the defaults used when the oven is turned on from Home Assistant.",
+        "title": "June Oven options"
+      }
+    }
+  }
+}

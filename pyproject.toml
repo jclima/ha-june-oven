@@ -1,0 +1,17 @@
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+  "ASYNC",
+  "B",
+  "E",
+  "F",
+  "I",
+  "SIM",
+  "UP"
+]
+
+[tool.ruff.format]
+quote-style = "double"

@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest an improvement to the June Oven integration
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What would you like Home Assistant to do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety and privacy
+      options:
+        - label: This request contains no credentials, pairing material, or private camera URLs.
+          required: true
