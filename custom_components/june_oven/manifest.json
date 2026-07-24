@@ -1,14 +1,14 @@
 {
+  "domain": "june_oven",
+  "name": "June Oven",
   "codeowners": [
     "@jclima"
   ],
   "config_flow": true,
   "documentation": "https://github.com/jclima/ha-june-oven",
-  "domain": "june_oven",
   "integration_type": "device",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/jclima/ha-june-oven/issues",
-  "name": "June Oven",
   "requirements": [
     "PyNaCl==1.6.2"
   ],

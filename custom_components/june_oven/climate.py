@@ -45,7 +45,6 @@ async def async_setup_entry(
 class JuneOvenClimate(JuneEntity, ClimateEntity):
     """Control a June oven as a heating-only climate entity."""
 
-    _attr_translation_key = "oven"
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE

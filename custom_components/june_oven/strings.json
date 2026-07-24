@@ -41,11 +41,6 @@
         "name": "Interior"
       }
     },
-    "climate": {
-      "oven": {
-        "name": null
-      }
-    },
     "sensor": {
       "probe_temperature": {
         "name": "Food probe"

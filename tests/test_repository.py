@@ -38,11 +38,23 @@ class RepositoryShapeTest(unittest.TestCase):
             self.assertIn(key, manifest)
         self.assertEqual(manifest["domain"], INTEGRATION.name)
         self.assertTrue(manifest["config_flow"])
+        self.assertEqual(
+            list(manifest),
+            ["domain", "name", *sorted(set(manifest) - {"domain", "name"})],
+        )
 
     def test_english_translation_matches_strings(self) -> None:
         strings = json.loads((INTEGRATION / "strings.json").read_text())
         english = json.loads((INTEGRATION / "translations" / "en.json").read_text())
         self.assertEqual(strings, english)
+        self._assert_string_leaves(strings)
+
+    def _assert_string_leaves(self, value: object) -> None:
+        if isinstance(value, dict):
+            for child in value.values():
+                self._assert_string_leaves(child)
+            return
+        self.assertIsInstance(value, str)
 
 
 if __name__ == "__main__":
