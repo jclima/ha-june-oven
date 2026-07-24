@@ -35,6 +35,7 @@ extracted app credentials required.
 - [Diagnostics, privacy, and security](#diagnostics-privacy-and-security)
 - [Removing the integration](#removing-the-integration)
 - [Development and contributing](#development-and-contributing)
+- [Support the project](#support-the-project)
 - [Provenance and license](#provenance-and-license)
 
 ## Features
@@ -369,6 +370,13 @@ For bugs, use the
 redacted diagnostics. This project is maintained independently; do not report
 integration bugs to HACS, Home Assistant, June, or the upstream Homebridge
 project.
+
+## Support the project
+
+If this integration is useful to you, you can support its continued
+development and maintenance:
+
+<a href="https://buymeacoffee.com/jclima"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" width="217"></a>
 
 ## Provenance and license
 
