@@ -44,3 +44,26 @@ jobs:
         run: python -m compileall -q custom_components tests
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+
+  home-assistant:
+    name: Home Assistant ${{ matrix.homeassistant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - homeassistant: "2025.1.0"
+            python: "3.13"
+          - homeassistant: "2026.7.3"
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install Home Assistant
+        run: python -m pip install --pre "homeassistant==${{ matrix.homeassistant }}"
+      - name: Exercise config flow
+        run: >-
+          python -m unittest discover -s tests
+          -p "test_config_flow_compatibility.py" -v
