@@ -6,3 +6,16 @@ __pycache__/
 .ruff_cache/
 .venv/
 .DS_Store
+# Home Assistant stores integration credentials, config entries, and backups here.
+.storage/
+*.backup
+*.tar.gz
+
+# Never commit local environment files or private keys/certificates.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx

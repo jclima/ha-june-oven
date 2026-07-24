@@ -1,0 +1,6 @@
+# The owner must review changes to the integration and its release safeguards.
+* @jclima
+/custom_components/ @jclima
+/.github/ @jclima
+/CODEOWNERS @jclima
+/SECURITY.md @jclima
