@@ -21,11 +21,11 @@ from .api import JuneError
 from .const import (
     CONF_DEFAULT_MODE,
     CONF_DEFAULT_TEMP_F,
-    DEFAULT_MODE,
     DEFAULT_MODES,
     DEFAULT_TEMP_F,
     MAX_TEMP_F,
     MIN_TEMP_F,
+    normalize_mode,
 )
 from .coordinator import JuneDataUpdateCoordinator
 from .entity import JuneEntity
@@ -45,6 +45,8 @@ async def async_setup_entry(
 class JuneOvenClimate(JuneEntity, ClimateEntity):
     """Control a June oven as a heating-only climate entity."""
 
+    _attr_name = None
+    _attr_translation_key = "oven"
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
@@ -64,9 +66,8 @@ class JuneOvenClimate(JuneEntity, ClimateEntity):
     ) -> None:
         super().__init__(coordinator, "climate")
         values = {**entry.data, **entry.options}
-        self._default_mode = str(values.get(CONF_DEFAULT_MODE, DEFAULT_MODE))
+        self._default_mode = normalize_mode(values.get(CONF_DEFAULT_MODE))
         self._default_temp_f = float(values.get(CONF_DEFAULT_TEMP_F, DEFAULT_TEMP_F))
-        self._attr_preset_modes = list(DEFAULT_MODES)
 
     @property
     def current_temperature(self) -> float | None:
@@ -93,10 +94,17 @@ class JuneOvenClimate(JuneEntity, ClimateEntity):
         return HVACAction.HEATING if self.coordinator.data.active else HVACAction.OFF
 
     @property
+    def preset_modes(self) -> list[str]:
+        """Return startable modes plus any program running on the oven."""
+        modes = list(DEFAULT_MODES)
+        if self.preset_mode not in modes:
+            modes.append(self.preset_mode)
+        return modes
+
+    @property
     def preset_mode(self) -> str:
-        """Return the selected cook mode."""
-        mode = self.coordinator.data.cook_mode
-        return mode if mode in DEFAULT_MODES else self._default_mode
+        """Return the running program, such as "proof", or the selected mode."""
+        return self.coordinator.data.cook_mode or self._default_mode
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Turn cooking on or off."""
@@ -110,10 +118,11 @@ class JuneOvenClimate(JuneEntity, ClimateEntity):
 
     async def async_turn_on(self) -> None:
         """Start the selected cook mode."""
+        mode = self.preset_mode
+        if mode not in DEFAULT_MODES:
+            mode = self._default_mode
         await self._run(
-            self.coordinator.client.async_preheat(
-                self.preset_mode, self.target_temperature
-            )
+            self.coordinator.client.async_preheat(mode, self.target_temperature)
         )
 
     async def async_turn_off(self) -> None:
@@ -136,6 +145,8 @@ class JuneOvenClimate(JuneEntity, ClimateEntity):
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Select a June cook primitive."""
+        if preset_mode == self.preset_mode:
+            return
         if preset_mode not in DEFAULT_MODES:
             raise HomeAssistantError(f"Unsupported June cook mode: {preset_mode}")
         await self._run(

@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import re
 import secrets
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 JUNE_API_URL: Final = "https://api.junelife.com"
 JUNE_MESSAGING_URL: Final = "https://messaging.junelife.com"
-JUNE_WS_URL: Final = "wss://messaging.junelife.com/1/messaging/websocket/companion"
+JUNE_WS_PATH: Final = "/1/messaging/websocket/companion"
+JUNE_WS_URL: Final = f"wss://messaging.junelife.com{JUNE_WS_PATH}"
 JUNE_USER_AGENT: Final = "okhttp/4.8.1"
 JUNE_APP_VERSION: Final = "1.24.1.11"
 JUNE_PLATFORM_VERSION: Final = "34"
@@ -30,11 +34,14 @@ JUNE_CLIENT_SECRET: Final = "tmoSUwt3OOZCcfMaIadAGD7-x-qPht85HkCgdvuhTKk1yFtfMcf
 
 MC_PREHEAT: Final = 11002
 MC_CANCEL: Final = 11004
+MC_SET_TEMPERATURE: Final = 11005
 MC_SET_TIMER: Final = 11006
 MC_KEEPALIVE: Final = 11011
 
 MC_CAMERA: Final = 10011
+MC_NOTIFICATION: Final = 10012
 MC_TELEMETRY: Final = 10013
+MC_PLAN_STARTED: Final = 10014
 MC_PLAN: Final = 10015
 MC_TEMPERATURE: Final = 10016
 MC_CANCELLED: Final = 10017
@@ -42,6 +49,18 @@ MC_DEVICE_STATE: Final = 10018
 MC_ACK: Final = 10020
 MC_PAIRING_INFO: Final = 10026
 MC_PAIRING_INVALIDATED: Final = 10027
+
+NOTIFICATION_PREHEAT_COMPLETE: Final = "NOTIFICATION_PREHEAT_COMPLETE"
+# The cook-plan step the oven holds at temperature until food goes in.
+PRESENTATION_PREHEAT: Final = "preheat"
+PRESENTATION_PREHEAT_AND_HOLD: Final = "preheat_and_hold"
+PRESENTATION_COOKING: Final = frozenset({"cook_bound", "cook_unbound"})
+
+PHASE_IDLE: Final = "idle"
+PHASE_PREHEATING: Final = "preheating"
+PHASE_PREHEATED: Final = "preheated"
+PHASE_COOKING: Final = "cooking"
+COOK_PHASES: Final = (PHASE_IDLE, PHASE_PREHEATING, PHASE_PREHEATED, PHASE_COOKING)
 
 # RFC 5054 8192-bit group used by the June app, with generator 19.
 SRP_N_HEX: Final = (
@@ -95,6 +114,111 @@ DAMM: Final = (
     (2, 5, 8, 1, 4, 3, 6, 7, 9, 0),
 )
 
+# Project July's june-local server serves the same routes over TLS on 443 and
+# over plain HTTP on this port.
+LOCAL_HTTP_PORT: Final = 8080
+
+_HOSTNAME = re.compile(
+    r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class JuneEndpoints:
+    """Every URL the companion uses, derived from one configured endpoint."""
+
+    api_url: str
+    messaging_url: str
+    ws_url: str
+    local: bool
+
+    @property
+    def status_url(self) -> str:
+        """Return the local server's machine-readable status URL."""
+        return f"{self.api_url}/local/status"
+
+    def local_media_url(self, candidate: Any) -> str | None:
+        """Re-home a camera URL onto the configured local server.
+
+        The local server names api.junelife.com (or its --media-url) in camera
+        frames because the oven believes it is talking to June's cloud. Only the
+        path is kept, so images are only ever fetched from the configured server.
+        """
+        if not self.local or not isinstance(candidate, str):
+            return None
+        parsed = urlsplit(candidate)
+        if not parsed.path.startswith("/media/") or ".." in parsed.path.split("/"):
+            return None
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"{self.api_url}{parsed.path}{query}"
+
+
+def normalize_endpoint(value: str) -> str:
+    """Normalize a user-entered endpoint to ``scheme://host[:port]``.
+
+    Accepts a hostname or an IPv4/IPv6 address, optionally with a port and an
+    ``https://`` or ``http://`` prefix. HTTPS is assumed; plain HTTP defaults to
+    the local server's port-8080 listener. An empty value returns "" and selects
+    June's public cloud. Raises ValueError for anything else.
+    """
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        if ipaddress.ip_address(value).version == 6:
+            value = f"[{value}]"
+    except ValueError:
+        pass
+    if "://" not in value:
+        value = f"https://{value}"
+
+    parsed = urlsplit(value)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported scheme: {parsed.scheme}")
+    if parsed.username or parsed.password or parsed.path.strip("/"):
+        raise ValueError("Enter only a hostname or IP address and optional port")
+    host = parsed.hostname
+    port = parsed.port  # Raises ValueError for a malformed port.
+    if not host:
+        raise ValueError("Missing hostname")
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        host = host.rstrip(".")
+        if not _HOSTNAME.fullmatch(host):
+            raise ValueError(f"Invalid hostname: {host}") from None
+    else:
+        host = f"[{address.compressed}]" if address.version == 6 else str(address)
+
+    if scheme == "http" and port is None:
+        port = LOCAL_HTTP_PORT
+    if scheme == "https" and port == 443:
+        port = None
+    return f"{scheme}://{host}" + (f":{port}" if port is not None else "")
+
+
+def build_endpoints(endpoint: str = "") -> JuneEndpoints:
+    """Derive every service URL from one endpoint; empty means June's cloud."""
+    base = normalize_endpoint(endpoint)
+    if not base:
+        return JuneEndpoints(
+            api_url=JUNE_API_URL,
+            messaging_url=JUNE_MESSAGING_URL,
+            ws_url=JUNE_WS_URL,
+            local=False,
+        )
+    scheme, _, netloc = base.partition("://")
+    ws_scheme = "wss" if scheme == "https" else "ws"
+    return JuneEndpoints(
+        api_url=base,
+        messaging_url=base,
+        ws_url=f"{ws_scheme}://{netloc}{JUNE_WS_PATH}",
+        local=True,
+    )
+
 
 def fahrenheit_to_millic(fahrenheit: float) -> int:
     """Convert degrees Fahrenheit to June's milli-Celsius wire unit."""
@@ -114,6 +238,210 @@ def celsius_to_fahrenheit(celsius: float) -> float:
 def fahrenheit_to_celsius(fahrenheit: float) -> float:
     """Convert degrees Fahrenheit to degrees Celsius."""
     return (fahrenheit - 32) * 5 / 9
+
+
+def _number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _mapping(value: Any) -> Mapping[str, Any] | None:
+    return value if isinstance(value, Mapping) else None
+
+
+def _string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+@dataclass(frozen=True, slots=True)
+class CookPlan:
+    """The parts of an oven cook plan the integration tracks."""
+
+    plan_id: int | None
+    name: str | None
+    session_id: str | None
+    presentation_type: str | None
+    target_millic: int | None
+
+
+def parse_cook_plan(value: Any) -> CookPlan | None:
+    """Parse a cook plan.
+
+    Plans arrive as the data of 10014/10015/10016, as ``cook_plan_data`` in every
+    10013, and as the REST status ``cook_plan``. The target and presentation come
+    from the current step, ``food.plan.steps[step_state.step_index]``: after a
+    temperature change the first step still holds the original target.
+    """
+    plan_data = _mapping(value)
+    if plan_data is None:
+        return None
+    food = _mapping(plan_data.get("food"))
+    if food is None:
+        return None
+    plan = _mapping(food.get("plan")) or {}
+    steps = plan.get("steps")
+    steps = steps if isinstance(steps, list) else []
+    step_state = _mapping(plan_data.get("step_state"))
+    index = _number(step_state.get("step_index")) if step_state else 0
+    step: Mapping[str, Any] = {}
+    if isinstance(index, int) and 0 <= index < len(steps):
+        step = _mapping(steps[index]) or {}
+    plan_id = _number(plan.get("id"))
+    target = _number(step.get("temperature_cavity"))
+    return CookPlan(
+        plan_id=int(plan_id) if plan_id is not None else None,
+        name=_string(food.get("name")),
+        session_id=_string(plan_data.get("session_id")),
+        presentation_type=_string(step.get("presentation_type")),
+        target_millic=int(target) if target is not None and target > 0 else None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CookProgress:
+    """Progress reported in a 10013 ``cook_state_data``."""
+
+    label_type: str | None
+    percent: float | None
+    elapsed_ms: int | None
+
+
+def parse_cook_progress(value: Any) -> CookProgress | None:
+    """Parse ``cook_state_data``.
+
+    ``progress`` is ``{"label_type", "label_value", "percentage"}``. The
+    percentage is already 0-100: 0.99 means 1% of the preheat gap is covered.
+    ``label_type`` is "temperature" while preheating (``label_value`` is the
+    cavity in milli-Celsius) and "time" while cooking (``label_value`` is the
+    elapsed milliseconds, also sent as ``cook_time_elapsed``).
+    """
+    cook_state = _mapping(value)
+    if cook_state is None:
+        return None
+    progress = _mapping(cook_state.get("progress")) or {}
+    label_type = _string(progress.get("label_type"))
+    percent = _number(progress.get("percentage"))
+    elapsed = _number(cook_state.get("cook_time_elapsed"))
+    if elapsed is None and label_type == "time":
+        elapsed = _number(progress.get("label_value"))
+    return CookProgress(
+        label_type=label_type,
+        percent=min(100.0, max(0.0, float(percent))) if percent is not None else None,
+        elapsed_ms=int(elapsed) if elapsed is not None else None,
+    )
+
+
+def cook_phase(
+    active: bool, presentation_type: str | None, label_type: str | None
+) -> str:
+    """Summarize what an active cook is doing."""
+    if not active:
+        return PHASE_IDLE
+    if presentation_type == PRESENTATION_PREHEAT:
+        return PHASE_PREHEATING
+    if presentation_type == PRESENTATION_PREHEAT_AND_HOLD:
+        return PHASE_PREHEATED
+    if presentation_type not in PRESENTATION_COOKING and label_type == "temperature":
+        return PHASE_PREHEATING
+    return PHASE_COOKING
+
+
+def connection_online(value: Any) -> bool | None:
+    """Map a connection state to online, offline, or unknown."""
+    if value in ("online", "connected"):
+        return True
+    if value in ("offline", "disconnected"):
+        return False
+    return None
+
+
+def _unwrap(value: Any) -> Mapping[str, Any] | None:
+    mapping = _mapping(value)
+    if mapping is not None and _mapping(mapping.get("data")) is not None:
+        return mapping["data"]
+    return mapping
+
+
+@dataclass(frozen=True, slots=True)
+class StatusSnapshot:
+    """A parsed REST status response."""
+
+    online: bool | None
+    device_state: str | None
+    cook_plan: CookPlan | None
+
+
+def parse_status(payload: Mapping[str, Any]) -> StatusSnapshot:
+    """Parse ``/1/messaging/device/{id}/status``.
+
+    june-local returns ``ha_connection_state`` "online"/"offline" beside
+    ``connection_state`` "connected"/"disconnected", and the raw
+    ``device_state`` and ``cook_plan`` beside ``{"data": ...}``-wrapped copies
+    under ``device_state_data`` and ``cook_plan_data``. June's cloud sent only
+    ``connection_state``, ``device_state`` and ``cook_plan``. The ``ha_`` and
+    ``_data`` aliases win; any field may be wrapped or bare.
+    """
+    online = connection_online(payload.get("ha_connection_state"))
+    if online is None:
+        online = connection_online(payload.get("connection_state"))
+    if online is None and isinstance(payload.get("online"), bool):
+        online = payload["online"]
+    device_state = None
+    for key in ("device_state_data", "device_state"):
+        device = _unwrap(payload.get(key))
+        device_state = _string(device.get("state")) if device else None
+        if device_state is not None:
+            break
+    cook_plan = parse_cook_plan(
+        _unwrap(payload.get("cook_plan_data"))
+    ) or parse_cook_plan(_unwrap(payload.get("cook_plan")))
+    return StatusSnapshot(
+        online=online,
+        device_state=device_state,
+        cook_plan=cook_plan,
+    )
+
+
+class PreheatWatch:
+    """Decide when a cook has just finished preheating.
+
+    The oven says so twice: the current step becomes preheat_and_hold, and it
+    sends a 10012 NOTIFICATION_PREHEAT_COMPLETE. Frames are not strictly
+    ordered (a 10015 can repeat the previous step after a 10016 moved on) and
+    REST snapshots lag the socket, so each cook session fires at most once. A
+    plan first seen already holding, such as after a restart, does not fire.
+    """
+
+    def __init__(self) -> None:
+        self._session: str | None = None
+        self._presentation: str | None = None
+        self._fired: str | None = None
+
+    def plan(self, plan: CookPlan) -> bool:
+        """Track a cook plan; return True when preheating just finished."""
+        if plan.session_id != self._session:
+            self._session = plan.session_id
+            self._presentation = None
+        previous, self._presentation = self._presentation, plan.presentation_type
+        if plan.presentation_type != PRESENTATION_PREHEAT_AND_HOLD or previous in (
+            None,
+            PRESENTATION_PREHEAT_AND_HOLD,
+        ):
+            return False
+        return self._fire(plan.session_id)
+
+    def notification(self, data: Mapping[str, Any]) -> bool:
+        """Track a 10012; return True when preheating just finished."""
+        if data.get("notification_id") != NOTIFICATION_PREHEAT_COMPLETE:
+            return False
+        return self._fire(_string(data.get("session_id")))
+
+    def _fire(self, session: str | None) -> bool:
+        if session is not None and session == self._fired:
+            return False
+        self._fired = session
+        return True
 
 
 def damm(input_value: str) -> int:

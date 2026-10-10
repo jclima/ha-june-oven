@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import secrets
+import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -17,40 +18,52 @@ from aiohttp import (
     ClientError,
     ClientResponse,
     ClientSession,
+    ClientSSLError,
     ClientWebSocketResponse,
     WSMsgType,
     WSServerHandshakeError,
 )
 
+from .const import DEFAULT_MODES
 from .protocol import (
-    JUNE_API_URL,
     JUNE_APP_VERSION,
     JUNE_CLIENT_ID,
     JUNE_CLIENT_SECRET,
-    JUNE_MESSAGING_URL,
     JUNE_PLATFORM_VERSION,
     JUNE_USER_AGENT,
-    JUNE_WS_URL,
     MC_ACK,
     MC_CAMERA,
     MC_CANCEL,
     MC_CANCELLED,
     MC_DEVICE_STATE,
     MC_KEEPALIVE,
+    MC_NOTIFICATION,
     MC_PAIRING_INFO,
     MC_PAIRING_INVALIDATED,
     MC_PLAN,
+    MC_PLAN_STARTED,
     MC_PREHEAT,
+    MC_SET_TEMPERATURE,
     MC_SET_TIMER,
     MC_TELEMETRY,
     MC_TEMPERATURE,
+    PHASE_IDLE,
+    CookPlan,
+    JuneEndpoints,
     OrderGenerator,
+    PreheatWatch,
     SrpServer,
+    build_endpoints,
     build_shown_code,
     build_signed_frame,
+    cook_phase,
+    fahrenheit_to_celsius,
     fahrenheit_to_millic,
     find_long_base64,
     millic_to_celsius,
+    parse_cook_plan,
+    parse_cook_progress,
+    parse_status,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,6 +73,10 @@ COMMAND_TIMEOUT = 6
 PAIRING_TIMEOUT = 5 * 60
 TRIGGER_PULSE_SECONDS = 30
 TRUSTED_CAMERA_HOSTS = {"api.junelife.com", "june-api.s3.amazonaws.com"}
+
+# aiohttp's per-request ``ssl`` value: True verifies against the system store,
+# False skips verification, and a context trusts a specific CA.
+SSLOption = ssl.SSLContext | bool
 
 
 class JuneError(Exception):
@@ -71,7 +88,15 @@ class JuneAuthenticationError(JuneError):
 
 
 class JuneConnectionError(JuneError):
-    """June's cloud could not be reached."""
+    """June's cloud or the local server could not be reached."""
+
+
+class JuneCertificateError(JuneConnectionError):
+    """The server's TLS certificate was not trusted."""
+
+
+class JuneNotLocalServerError(JuneError):
+    """The endpoint answered, but it is not a Project July local server."""
 
 
 class JuneCommandError(JuneError):
@@ -120,12 +145,17 @@ class JuneIdentity:
 class JuneState:
     """Latest state retained in memory for Home Assistant entities."""
 
+    # Normalized to "online", "offline", or "unknown".
     connection_state: str = "unknown"
     active: bool = False
     current_temp_c: float | None = None
     target_temp_c: float | None = None
-    cook_mode: str = "bake"
+    # The primitive or program name the oven reports, such as "bake" or "proof".
+    cook_mode: str | None = None
+    plan_id: int = 0
+    cook_phase: str = PHASE_IDLE
     progress_percent: float | None = None
+    cook_elapsed_s: float | None = None
     probe_temp_c: float | None = None
     probe_present: bool | None = None
     ready: bool = False
@@ -151,11 +181,15 @@ class JuneClient:
         session: ClientSession,
         identity: JuneIdentity,
         *,
+        endpoints: JuneEndpoints | None = None,
+        ssl_option: SSLOption = True,
         token_callback: TokenCallback | None = None,
         update_callback: UpdateCallback | None = None,
     ) -> None:
         self.session = session
         self.identity = identity
+        self.endpoints = endpoints or build_endpoints()
+        self._ssl = ssl_option
         self.state = JuneState()
         self.token_callback = token_callback
         self.update_callback = update_callback
@@ -167,8 +201,10 @@ class JuneClient:
         self._pending: dict[int, asyncio.Future[str | None]] = {}
         self._connected = asyncio.Event()
         self._stopped = False
-        self._last_active = False
         self._last_cancelled = False
+        self._presentation: str | None = None
+        self._label_type: str | None = None
+        self._preheat = PreheatWatch()
         self._command_lock = asyncio.Lock()
 
     def set_update_callback(self, callback: UpdateCallback) -> None:
@@ -191,13 +227,16 @@ class JuneClient:
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):
                 async with self.session.post(
-                    f"{JUNE_API_URL}/2/devices/register",
+                    f"{self.endpoints.api_url}/2/devices/register",
                     json=body,
                     headers={"User-Agent": JUNE_USER_AGENT},
+                    ssl=self._ssl,
                 ) as response:
                     payload = await self._checked_json(response, "Token refresh")
         except JuneError:
             raise
+        except ClientSSLError as err:
+            raise JuneCertificateError(f"Token refresh failed: {err}") from err
         except (TimeoutError, ClientError) as err:
             raise JuneConnectionError(f"Token refresh failed: {err}") from err
 
@@ -215,11 +254,14 @@ class JuneClient:
 
     async def async_fetch_status(self, *, retry_auth: bool = True) -> JuneState:
         """Fetch the oven's REST status snapshot."""
-        url = f"{JUNE_MESSAGING_URL}/1/messaging/device/{self.identity.oven_id}/status"
+        url = (
+            f"{self.endpoints.messaging_url}/1/messaging/device/"
+            f"{self.identity.oven_id}/status"
+        )
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):
                 async with self.session.get(
-                    url, headers=self._authorization_headers()
+                    url, headers=self._authorization_headers(), ssl=self._ssl
                 ) as response:
                     if response.status == 401 and retry_auth:
                         response.release()
@@ -284,24 +326,41 @@ class JuneClient:
         )
         self._require_success(status, "start cook")
         self.state.cook_mode = mode
-        self.state.target_temp_c = (temperature_f - 32) * 5 / 9
+        self.state.target_temp_c = fahrenheit_to_celsius(temperature_f)
         self.state.done = False
         self._notify()
 
     async def async_cancel(self) -> None:
         """Cancel the active cook."""
         self._last_cancelled = True
-        status = await self._async_send_command(MC_CANCEL, {"plan_id": 0})
+        status = await self._async_send_command(
+            MC_CANCEL, {"plan_id": self.state.plan_id}
+        )
         if status not in ("success", "not-allowed"):
             self._last_cancelled = False
             self._require_success(status, "cancel cook")
 
     async def async_set_target_f(self, temperature_f: float, mode: str) -> None:
-        """Set a target, restarting an active cook when necessary."""
-        self.state.target_temp_c = (temperature_f - 32) * 5 / 9
-        self._notify()
+        """Set a target, changing an active cook in place when the oven allows."""
         if not self.state.active:
+            self.state.target_temp_c = fahrenheit_to_celsius(temperature_f)
+            self._notify()
             return
+        status = await self._async_send_command(
+            MC_SET_TEMPERATURE,
+            {
+                "plan_id": self.state.plan_id,
+                "temperature_cavity": fahrenheit_to_millic(temperature_f),
+            },
+        )
+        if status == "success":
+            self.state.target_temp_c = fahrenheit_to_celsius(temperature_f)
+            self._notify()
+            return
+        # Restart only after a definite refusal, and only for a primitive the
+        # oven can start again; a timeout may still have applied the change.
+        if status is None or mode not in DEFAULT_MODES:
+            self._require_success(status, "change the temperature")
         await self.async_cancel()
         await asyncio.sleep(0.4)
         await self.async_preheat(mode, temperature_f)
@@ -320,18 +379,23 @@ class JuneClient:
         """Set the oven's native cook timer."""
         status = await self._async_send_command(
             MC_SET_TIMER,
-            {"plan_id": 0, "duration": round(minutes * 60_000)},
+            {"plan_id": self.state.plan_id, "duration": round(minutes * 60_000)},
         )
         self._require_success(status, "set timer")
 
     async def async_fetch_camera_image(self) -> bytes | None:
         """Fetch the most recent trusted camera image."""
-        url = self.state.snapshot_url
-        if not url or not self._is_trusted_camera_url(url):
+        url = self._camera_url(self.state.snapshot_url)
+        if not url:
             return None
+        # Local images come from the configured server; cloud images may come
+        # from S3, which must be verified against the system store.
+        ssl_option = self._ssl if self.endpoints.local else True
         try:
             async with asyncio.timeout(8):
-                async with self.session.get(url, allow_redirects=False) as response:
+                async with self.session.get(
+                    url, allow_redirects=False, ssl=ssl_option
+                ) as response:
                     if response.status != 200:
                         return None
                     try:
@@ -383,13 +447,14 @@ class JuneClient:
 
     async def _websocket_once(self) -> None:
         async with self.session.ws_connect(
-            JUNE_WS_URL,
+            self.endpoints.ws_url,
             headers={
                 **self._authorization_headers(),
                 "User-Agent": JUNE_USER_AGENT,
             },
             heartbeat=20,
             compress=0,
+            ssl=self._ssl,
         ) as websocket:
             self._ws = websocket
             self._connected.set()
@@ -476,46 +541,53 @@ class JuneClient:
                 future.set_result(self.state.last_ack_status)
             return
 
+        # Frames are applied in receive order. Their "time" is the oven's clock,
+        # which can read 2022 until it syncs, so it is never used for timing.
         if code == MC_TELEMETRY:
             self._apply_telemetry(data)
         elif code == MC_CAMERA:
-            candidate = data.get("image_url") or data.get("signed_url")
-            if self._is_trusted_camera_url(candidate):
+            candidate = self._camera_url(
+                data.get("image_url") or data.get("signed_url")
+            )
+            if candidate:
                 self.state.snapshot_url = candidate
-        elif code in (MC_PLAN, MC_TEMPERATURE):
-            target = self._find_temperature(data)
-            if target is not None:
-                self.state.target_temp_c = millic_to_celsius(target)
-            food = data.get("food")
-            if isinstance(food, dict) and isinstance(food.get("name"), str):
-                self.state.cook_mode = food["name"]
-        elif code == MC_CANCELLED and data.get("type") == "cancelled":
-            self._last_cancelled = True
+        elif code in (MC_PLAN_STARTED, MC_PLAN, MC_TEMPERATURE):
+            self._apply_plan(parse_cook_plan(data))
+        elif code == MC_NOTIFICATION:
+            if self._preheat.notification(data):
+                self._start_pulse("ready")
+        elif code == MC_CANCELLED:
+            if data.get("type") == "cancelled":
+                self._last_cancelled = True
         elif code == MC_DEVICE_STATE:
             self._apply_active(data.get("state") == "active")
         else:
             return
+        # Every frame handled above comes from the oven, so it is connected.
+        self.state.connection_state = "online"
         self._notify()
 
     def _apply_status(self, payload: Mapping[str, Any]) -> None:
-        connection = payload.get("connection_state")
-        if isinstance(connection, str):
-            self.state.connection_state = connection
-        device_state = payload.get("device_state")
-        if isinstance(device_state, dict):
-            state_data = device_state.get("data")
-            if isinstance(state_data, dict):
-                self._apply_active(state_data.get("state") == "active")
-        cook_plan = payload.get("cook_plan")
-        if isinstance(cook_plan, dict):
-            plan_data = cook_plan.get("data")
-            if isinstance(plan_data, dict):
-                target = self._find_temperature(plan_data)
-                if target is not None:
-                    self.state.target_temp_c = millic_to_celsius(target)
-                food = plan_data.get("food")
-                if isinstance(food, dict) and isinstance(food.get("name"), str):
-                    self.state.cook_mode = food["name"]
+        status = parse_status(payload)
+        if status.online is not None:
+            self.state.connection_state = "online" if status.online else "offline"
+        if status.device_state is not None:
+            self._apply_active(status.device_state == "active")
+        self._apply_plan(status.cook_plan)
+
+    def _apply_plan(self, plan: CookPlan | None) -> None:
+        # june-local keeps serving the last plan after a cook ends.
+        if plan is None or not self.state.active:
+            return
+        if plan.plan_id is not None:
+            self.state.plan_id = plan.plan_id
+        if plan.name is not None:
+            self.state.cook_mode = plan.name
+        if plan.target_millic is not None:
+            self.state.target_temp_c = millic_to_celsius(plan.target_millic)
+        self._presentation = plan.presentation_type
+        if self._preheat.plan(plan):
+            self._start_pulse("ready")
 
     def _apply_telemetry(self, data: Mapping[str, Any]) -> None:
         sensor_data = data.get("sensor_data")
@@ -539,32 +611,35 @@ class JuneClient:
                     millic_to_celsius(reading) if reading is not None else None
                 )
 
-        cook_state = data.get("cook_state_data")
-        if isinstance(cook_state, dict):
-            progress = cook_state.get("progress")
-            if isinstance(progress, (int, float)):
-                normalized = float(progress)
-                self.state.progress_percent = (
-                    normalized * 100 if normalized <= 1 else normalized
-                )
-                is_ready = (
-                    normalized >= 0.995
-                    and self.state.current_temp_c is not None
-                    and self.state.target_temp_c is not None
-                    and self.state.current_temp_c + 0.6 >= self.state.target_temp_c
-                )
-                if is_ready and not self.state.ready:
-                    self._start_pulse("ready")
+        progress = parse_cook_progress(data.get("cook_state_data"))
+        if progress is not None and self.state.active:
+            self.state.progress_percent = progress.percent
+            self.state.cook_elapsed_s = (
+                progress.elapsed_ms / 1000 if progress.elapsed_ms is not None else None
+            )
+            self._label_type = progress.label_type
+        self._apply_plan(parse_cook_plan(data.get("cook_plan_data")))
 
     def _apply_active(self, active: bool) -> None:
-        if self._last_active and not active and not self._last_cancelled:
-            self._start_pulse("done")
+        was_active = self.state.active
         self.state.active = active
-        self._last_active = active
-        if active:
+        if active and not was_active:
             self._last_cancelled = False
             self.state.done = False
             self.state.ready = False
+        elif was_active and not active:
+            if not self._last_cancelled:
+                self._start_pulse("done")
+            self.state.plan_id = 0
+            self.state.progress_percent = None
+            self.state.cook_elapsed_s = None
+            self._presentation = None
+            self._label_type = None
+            # Oven-screen programs cannot be restarted by name; let the climate
+            # entity fall back to its configured defaults.
+            if self.state.cook_mode not in DEFAULT_MODES:
+                self.state.cook_mode = None
+                self.state.target_temp_c = None
 
     def _start_pulse(self, field: str) -> None:
         setattr(self.state, field, True)
@@ -587,6 +662,9 @@ class JuneClient:
                 self._pulse_tasks.pop(field, None)
 
     def _notify(self) -> None:
+        self.state.cook_phase = cook_phase(
+            self.state.active, self._presentation, self._label_type
+        )
         if self.update_callback:
             self.update_callback(self.state)
 
@@ -612,29 +690,57 @@ class JuneClient:
                 f"June could not {operation}: {status or 'no acknowledgement'}"
             )
 
-    @staticmethod
-    def _find_temperature(value: Any) -> int | float | None:
-        if isinstance(value, dict):
-            direct = value.get("temperature_cavity")
-            if isinstance(direct, (int, float)):
-                return direct
-            for child in value.values():
-                found = JuneClient._find_temperature(child)
-                if found is not None:
-                    return found
-        elif isinstance(value, list):
-            for child in value:
-                found = JuneClient._find_temperature(child)
-                if found is not None:
-                    return found
+    def _camera_url(self, candidate: Any) -> str | None:
+        """Return a camera URL that is safe to fetch, or None."""
+        if self.endpoints.local:
+            return self.endpoints.local_media_url(candidate)
+        if not isinstance(candidate, str):
+            return None
+        parsed = urlparse(candidate)
+        if parsed.scheme == "https" and parsed.hostname in TRUSTED_CAMERA_HOSTS:
+            return candidate
         return None
 
-    @staticmethod
-    def _is_trusted_camera_url(candidate: Any) -> bool:
-        if not isinstance(candidate, str):
-            return False
-        parsed = urlparse(candidate)
-        return parsed.scheme == "https" and parsed.hostname in TRUSTED_CAMERA_HOSTS
+
+def create_ssl_option(verify_ssl: bool, ca_cert: str = "") -> SSLOption:
+    """Build the TLS setting for a server.
+
+    A pasted CA certificate trusts only that CA, such as a Project July
+    per-install CA. This loads certificates, so call it from an executor.
+    Raises ssl.SSLError or ValueError for an unusable certificate.
+    """
+    if not verify_ssl:
+        return False
+    if not ca_cert.strip():
+        return True
+    return ssl.create_default_context(cadata=ca_cert.strip())
+
+
+async def async_check_local_server(
+    session: ClientSession,
+    endpoints: JuneEndpoints,
+    ssl_option: SSLOption = True,
+) -> None:
+    """Confirm a local endpoint is a reachable, trusted Project July server."""
+    try:
+        async with asyncio.timeout(REQUEST_TIMEOUT):
+            async with session.get(endpoints.status_url, ssl=ssl_option) as response:
+                if response.status != 200:
+                    await response.read()
+                    raise JuneNotLocalServerError(
+                        f"Status check returned HTTP {response.status}"
+                    )
+                payload = await response.json(content_type=None)
+    except JuneError:
+        raise
+    except ClientSSLError as err:
+        raise JuneCertificateError(f"Status check failed: {err}") from err
+    except (TimeoutError, ClientError) as err:
+        raise JuneConnectionError(f"Status check failed: {err}") from err
+    except ValueError as err:
+        raise JuneNotLocalServerError("Status check returned invalid JSON") from err
+    if not isinstance(payload, dict) or payload.get("server") != "june-local":
+        raise JuneNotLocalServerError("The endpoint is not a june-local server")
 
 
 class JunePairingSession:
@@ -645,10 +751,15 @@ class JunePairingSession:
         session: ClientSession,
         device_name: str,
         timezone: str = "UTC",
+        *,
+        endpoints: JuneEndpoints | None = None,
+        ssl_option: SSLOption = True,
     ) -> None:
         self.session = session
         self.device_name = device_name
         self.timezone = timezone
+        self.endpoints = endpoints or build_endpoints()
+        self._ssl = ssl_option
         self.shown_code: str | None = None
         self.identity: JuneIdentity | None = None
         self.error: JuneError | None = None
@@ -673,14 +784,19 @@ class JunePairingSession:
         self._encryption_key = PrivateKey.generate()
         try:
             self._ws = await self.session.ws_connect(
-                JUNE_WS_URL,
+                self.endpoints.ws_url,
                 headers={
                     "Authorization": (f"Bearer {self._registration['access_token']}"),
                     "User-Agent": JUNE_USER_AGENT,
                 },
                 heartbeat=20,
                 compress=0,
+                ssl=self._ssl,
             )
+        except ClientSSLError as err:
+            raise JuneCertificateError(
+                f"Could not open June pairing socket: {err}"
+            ) from err
         except (TimeoutError, ClientError) as err:
             raise JuneConnectionError(
                 f"Could not open June pairing socket: {err}"
@@ -750,15 +866,18 @@ class JunePairingSession:
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):
                 async with self.session.post(
-                    f"{JUNE_API_URL}/2/devices/register",
+                    f"{self.endpoints.api_url}/2/devices/register",
                     json=body,
                     headers={"User-Agent": JUNE_USER_AGENT},
+                    ssl=self._ssl,
                 ) as response:
                     payload = await JuneClient._checked_json(
                         response, "Device registration"
                     )
         except JuneError:
             raise
+        except ClientSSLError as err:
+            raise JuneCertificateError(f"Device registration failed: {err}") from err
         except (TimeoutError, ClientError) as err:
             raise JuneConnectionError(f"Device registration failed: {err}") from err
         token = payload.get("token")
@@ -778,7 +897,8 @@ class JunePairingSession:
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):
                 async with self.session.post(
-                    f"{JUNE_API_URL}/2/devices/pairing",
+                    f"{self.endpoints.api_url}/2/devices/pairing",
+                    ssl=self._ssl,
                     headers={
                         "Authorization": (
                             f"Bearer {self._registration['access_token']}"
@@ -868,8 +988,12 @@ class JunePairingSession:
             }
             async with asyncio.timeout(REQUEST_TIMEOUT):
                 async with self.session.post(
-                    (f"{JUNE_API_URL}/2/devices/pairing/{self._server_code}/companion"),
+                    (
+                        f"{self.endpoints.api_url}/2/devices/pairing/"
+                        f"{self._server_code}/companion"
+                    ),
                     json=body,
+                    ssl=self._ssl,
                     headers={
                         "Authorization": (
                             f"Bearer {self._registration['access_token']}"
@@ -896,9 +1020,10 @@ class JunePairingSession:
                 async with asyncio.timeout(REQUEST_TIMEOUT):
                     async with self.session.get(
                         (
-                            f"{JUNE_API_URL}/2/devices/"
+                            f"{self.endpoints.api_url}/2/devices/"
                             f"{self._registration['device_id']}/associated"
                         ),
+                        ssl=self._ssl,
                         headers={
                             "Authorization": (
                                 f"Bearer {self._registration['access_token']}"

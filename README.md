@@ -6,9 +6,10 @@
 [![Home Assistant 2025.1+](https://img.shields.io/badge/Home%20Assistant-2025.1%2B-41BDF5)](https://www.home-assistant.io/)
 
 An unofficial Home Assistant custom integration for pairing with, monitoring,
-and controlling June ovens. It communicates directly with June's cloud as a
-paired companion—no Homebridge, Apple HomeKit, June account login, or
-extracted app credentials required.
+and controlling June ovens. It pairs as a companion with an oven running the
+[Project July](https://project-july.org) local server, or with June's cloud,
+with no Homebridge, Apple HomeKit, June account login, or extracted app
+credentials required.
 
 [![Open your Home Assistant instance and add this repository to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=jclima&repository=ha-june-oven&category=integration)
 
@@ -28,6 +29,7 @@ extracted app credentials required.
 - [Requirements and limitations](#requirements-and-limitations)
 - [Installation](#installation)
 - [Pairing the oven](#pairing-the-oven)
+- [Project July local server](#project-july-local-server)
 - [Configuration](#configuration)
 - [Entities and controls](#entities-and-controls)
 - [Automations](#automations)
@@ -44,9 +46,10 @@ extracted app credentials required.
 - Climate entity with current temperature, target temperature, on/off, and
   cook-mode presets.
 - Connectivity, preheat-ready, and cook-done binary sensors.
-- Food-probe temperature and cook-progress sensors.
+- Food-probe temperature, cook-progress, cook-phase, and elapsed-time sensors.
 - Interior-camera snapshots while the oven is cooking.
-- Live WebSocket telemetry with a periodic cloud-status fallback.
+- Works with a Project July local server by oven hostname or IP address.
+- Live WebSocket telemetry with a periodic status fallback.
 - Signed command acknowledgements, automatic token renewal, and reconnects.
 - Multiple ovens by adding the integration once per oven.
 - Downloadable diagnostics with credentials and camera URLs redacted.
@@ -56,23 +59,27 @@ extracted app credentials required.
 | Requirement | Details |
 | --- | --- |
 | Home Assistant | Version 2025.1 or newer |
-| Oven | A June oven connected to Wi-Fi and June's cloud |
-| Network | Outbound internet access from Home Assistant |
+| Oven | A June oven running the Project July local server, or connected to June's cloud |
+| Network | Home Assistant can reach the oven on the LAN (Project July), or has internet access (June cloud) |
 | Pairing access | Physical access to the oven's **Connect** screen |
 | Distribution | HACS custom repository or manual installation |
 
-This is a cloud-push integration, not local-LAN control. If June's cloud, the
-oven's internet connection, or Home Assistant's internet connection is
-unavailable, monitoring and control will be unavailable.
+With an oven address configured, Home Assistant talks only to the Project
+July server on your network; no internet access is needed. Without an oven
+address it uses June's cloud, and monitoring and control depend on that
+service, the oven's internet connection, and Home Assistant's internet
+connection.
 
 Additional behavior to know:
 
 - Target temperatures range from 100 °F to 500 °F in 5 °F steps.
 - Supported cook presets are **Bake**, **Roast**, **Broil**, **Air fry**, and
-  **Toast**.
-- Changing the temperature or cook mode during an active cook cancels and
-  restarts that cook because the oven does not reliably apply those changes
-  in place.
+  **Toast**. A program started on the oven's touchscreen, such as **Proof**,
+  is shown as the preset while it runs.
+- Changing the temperature during an active cook is applied in place. If the
+  oven refuses, a cook started from one of the presets above is cancelled and
+  restarted at the new temperature; other programs are left running. Changing
+  the cook mode always cancels and restarts the cook.
 - The camera is June's native still-image feed, approximately one frame per
   second while cooking. It is not continuous video or recording.
 - The integration does not expose June's guided recipes or food-recognition
@@ -147,6 +154,11 @@ Pairing creates a private June companion identity for Home Assistant.
 3. Enter:
 
    - **Oven name**: the companion and device name, such as `Kitchen June`.
+   - **Oven address**: the oven's hostname or IP address, such as
+     `192.168.1.75`. Leave empty to use June's cloud. See
+     [Project July local server](#project-july-local-server).
+   - **Verify TLS certificate** and **CA certificate (PEM)**: how Home
+     Assistant trusts the oven's certificate.
    - **Default cook mode**: the mode used when turning the climate entity on.
    - **Default temperature**: the initial target, from 100 °F to 500 °F.
 
@@ -163,14 +175,64 @@ cancel the Home Assistant flow and start again to receive a new code.
 To add another oven, repeat these steps. Each oven receives an independent
 companion identity and Home Assistant device.
 
+## Project July local server
+
+[Project July](https://project-july.org) runs `june-local` on the oven itself,
+answering the same REST and WebSocket routes June's cloud used. The
+integration derives every URL from the one **Oven address**, in the same way
+as the Project July phone build:
+
+| Purpose | URL |
+| --- | --- |
+| REST API and messaging | `https://<address>` |
+| WebSocket | `wss://<address>/1/messaging/websocket/companion` |
+| Server check | `https://<address>/local/status` |
+| Camera stills | `https://<address>/media/...` |
+
+Accepted address forms:
+
+| You enter | Home Assistant uses |
+| --- | --- |
+| `192.168.1.75` | `https://192.168.1.75` |
+| `june-oven.local` | `https://june-oven.local` |
+| `192.168.1.75:8443` | `https://192.168.1.75:8443` |
+| `fe80::1` | `https://[fe80::1]` |
+| `http://192.168.1.75` | `http://192.168.1.75:8080`, the plaintext listener |
+
+Before pairing, and whenever the address changes, Home Assistant checks
+`/local/status` and continues only if the server reports `june-local`.
+
+### Trusting the oven's certificate
+
+`june-local` serves a per-install certificate signed by your own CA, which
+Home Assistant does not trust by default. Choose one option:
+
+1. **Paste the CA (recommended).** Paste the contents of the `ca.crt` produced
+   by `generate_certs.sh` into **CA certificate (PEM)** and keep **Verify TLS
+   certificate** on. Home Assistant then trusts only that CA for the oven. The
+   oven address must match a `DNS:` or `IP:` name in the leaf certificate
+   (`JUNE_HOSTNAME` or `JUNE_IP_SAN` when the certificates were generated).
+2. **Turn off Verify TLS certificate.** The connection stays encrypted and
+   commands stay signed, but anyone on your network could impersonate the
+   oven's server.
+3. **Use the plaintext listener** by entering `http://<oven-ip>`. This avoids
+   certificates entirely and is not encrypted. Pairing stays SRP-protected
+   and commands stay signed.
+
 ## Configuration
 
-To change the default cook mode or temperature:
+To change the oven address, certificate settings, default cook mode, or
+default temperature:
 
 1. Open **Settings → Devices & services**.
 2. Find **June Oven**.
 3. Select **Configure**.
-4. Choose the new defaults and select **Submit**.
+4. Change the settings and select **Submit**.
+
+The integration reloads and reconnects immediately. Changing the address,
+for example after the oven gets a new IP address, keeps the existing pairing;
+you do not need to pair again. Pointing an existing entry at a different
+oven's server does not work; add that oven as a new integration instead.
 
 The defaults are used when a cook does not already have a selected target or
 mode. They do not automatically start the oven.
@@ -183,11 +245,13 @@ in Home Assistant instead of relying on the examples below.
 | Entity | Type | Purpose |
 | --- | --- | --- |
 | Oven | Climate | Start or cancel cooking, select a mode, and set target temperature |
-| Connectivity | Binary sensor | Reports whether June's cloud says the oven is online |
-| Preheat ready | Binary sensor | Pulses on for 30 seconds when the oven reaches temperature |
+| Connectivity | Binary sensor | Reports whether the server says the oven is connected |
+| Preheat ready | Binary sensor | Pulses on for 30 seconds when the oven finishes preheating |
 | Cook done | Binary sensor | Pulses on for 30 seconds after a cook ends without cancellation |
 | Food probe | Sensor | Latest connected probe temperature |
-| Cook progress | Sensor | Native cook progress reported by the oven |
+| Cook progress | Sensor | Progress reported by the oven, 0-100%: preheat progress while preheating |
+| Cook phase | Sensor | Idle, preheating, preheated (holding temperature for food), or cooking |
+| Cook time elapsed | Sensor | Cooking time reported by the oven; empty while preheating |
 | Interior | Camera | Latest signed interior-camera still |
 
 ### Climate entity
@@ -197,11 +261,20 @@ The climate entity provides two HVAC modes:
 - **Heat** starts the selected cook preset at the selected target temperature.
 - **Off** sends a cook-cancellation command.
 
-Changing the preset or target while the oven is active sends a cancellation,
-waits briefly, and starts a replacement cook. Any timer or progress associated
-with the original cook may be lost.
+Changing the target while the oven is active asks the oven to change the
+running cook, keeping its timer and progress. If the oven refuses, a cook
+started from a preset is cancelled and restarted at the new target, and any
+timer or progress associated with the original cook may be lost. Changing the
+preset while the oven is active always cancels and restarts the cook.
+
+While a program started on the oven's touchscreen runs, the climate entity
+shows it as the preset. **Heat** starts the configured default mode instead
+after such a program ends.
 
 ### Ready and done events
+
+**Preheat ready** turns on when the oven reports that preheating finished and
+it is holding temperature until food goes in. It fires once per cook.
 
 **Preheat ready** and **Cook done** are deliberately short-lived binary
 sensors. Each remains on for 30 seconds so it can trigger an automation, then
@@ -275,19 +348,35 @@ automation:
   seconds and select **Submit** again.
 - If the flow was closed or Home Assistant restarted, begin pairing again.
 
+### Setup reports a connection or certificate problem
+
+- Open `http://<oven-ip>:8080/local` from a device on the same network. It
+  should say `june-local` is running.
+- **Could not connect**: check the address and that Home Assistant can
+  reach the oven, for example that it is not on an isolated VLAN or guest
+  network.
+- **Not a Project July local server**: something else answered at that
+  address. Check for a typo or a changed IP address.
+- **Certificate not trusted**: paste the CA from the same install as the
+  oven's certificate, and enter the address exactly as it appears in the
+  certificate. For example, a certificate generated with only
+  `JUNE_HOSTNAME=oven.local` does not match `192.168.1.75`.
+
 ### Entities are unavailable
 
 - Confirm the oven itself reports that it is connected to Wi-Fi.
-- Confirm Home Assistant has working internet access.
-- Check whether June's cloud or API is unavailable.
+- With an oven address, confirm the oven's IP address has not changed. If it
+  has, update it under **Configure**. Consider a DHCP reservation for the oven.
+- Without an oven address, confirm Home Assistant has working internet
+  access and check whether June's cloud or API is unavailable.
 - Reload the integration from **Settings → Devices & services → June Oven**.
 - Download diagnostics and inspect the connection state before opening an
   issue.
 
 ### A temperature or mode change restarted cooking
 
-This is expected. June does not reliably apply in-place changes to an active
-cook, so the integration cancels and restarts it with the new settings.
+A mode change always restarts the cook. A temperature change restarts it only
+when the oven refuses to change the running cook in place.
 
 ### The interior camera is blank
 

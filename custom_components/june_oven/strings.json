@@ -5,7 +5,11 @@
       "pairing_lost": "The pairing session was lost. Start again."
     },
     "error": {
-      "cannot_connect": "Could not connect to June's cloud. Check Home Assistant's internet connection and try again.",
+      "cannot_connect": "Could not connect. Check the oven address, that the oven is switched on, and that Home Assistant can reach it. Without an oven address, Home Assistant needs internet access to reach June's cloud.",
+      "certificate_error": "The server's TLS certificate is not trusted. Paste your Project July CA certificate, make sure the oven address matches a name or IP address in the certificate, or turn off certificate verification.",
+      "invalid_ca_cert": "This is not a valid PEM certificate. Paste the full contents of ca.crt, including the BEGIN and END lines.",
+      "invalid_endpoint": "Enter a hostname or IP address with an optional port, such as 192.168.1.75 or june-oven.local:443.",
+      "not_local_server": "Something answered at this address, but it is not a Project July local server. Check the oven address.",
       "not_paired_yet": "The oven has not finished pairing. Enter the code on the oven, wait a few seconds, and try again.",
       "pairing_failed": "The oven rejected or could not finish pairing. Confirm it is idle, closed, online, and try again."
     },
@@ -16,8 +20,17 @@
       },
       "user": {
         "data": {
+          "ca_cert": "CA certificate (PEM)",
           "default_mode": "Default cook mode",
-          "default_temp_f": "Default temperature"
+          "default_temp_f": "Default temperature",
+          "device_name": "Oven name",
+          "endpoint": "Oven address",
+          "verify_ssl": "Verify TLS certificate"
+        },
+        "data_description": {
+          "ca_cert": "Paste your Project July ca.crt so Home Assistant trusts the oven's per-install certificate. Leave empty to use the system certificate store.",
+          "endpoint": "Hostname or IP address of an oven running the Project July local server, such as 192.168.1.75 or june-oven.local. Add a port if needed, or start with {http_prefix} to use the plain port-8080 listener. Leave empty to use June's cloud.",
+          "verify_ssl": "Turn off only if the oven's certificate cannot be trusted any other way. Commands stay signed, but the connection could be intercepted on your network."
         },
         "description": "Home Assistant will create a private companion identity and pair directly with the oven. No June account login is needed.",
         "title": "Set up June Oven"
@@ -41,7 +54,42 @@
         "name": "Interior"
       }
     },
+    "climate": {
+      "oven": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "airfry": "Air fry",
+              "bake": "Bake",
+              "broil": "Broil",
+              "dehydrate": "Dehydrate",
+              "grill": "Grill",
+              "pizzaiolo": "Pizza",
+              "proof": "Proof",
+              "reheat": "Reheat",
+              "roast": "Roast",
+              "slow_cook": "Slow cook",
+              "sous_vide": "Sous vide",
+              "toast": "Toast",
+              "warm": "Keep warm"
+            }
+          }
+        }
+      }
+    },
     "sensor": {
+      "cook_elapsed": {
+        "name": "Cook time elapsed"
+      },
+      "cook_phase": {
+        "name": "Cook phase",
+        "state": {
+          "cooking": "Cooking",
+          "idle": "Idle",
+          "preheated": "Preheated",
+          "preheating": "Preheating"
+        }
+      },
       "probe_temperature": {
         "name": "Food probe"
       },
@@ -51,15 +99,41 @@
     }
   },
   "options": {
+    "error": {
+      "cannot_connect": "Could not connect. Check the oven address, that the oven is switched on, and that Home Assistant can reach it.",
+      "certificate_error": "The server's TLS certificate is not trusted. Paste your Project July CA certificate, make sure the oven address matches a name or IP address in the certificate, or turn off certificate verification.",
+      "invalid_ca_cert": "This is not a valid PEM certificate. Paste the full contents of ca.crt, including the BEGIN and END lines.",
+      "invalid_endpoint": "Enter a hostname or IP address with an optional port, such as 192.168.1.75 or june-oven.local:443.",
+      "not_local_server": "Something answered at this address, but it is not a Project July local server. Check the oven address."
+    },
     "step": {
       "init": {
         "data": {
+          "ca_cert": "CA certificate (PEM)",
           "default_mode": "Default cook mode",
           "default_temp_f": "Default temperature",
-          "device_name": "Oven name"
+          "device_name": "Oven name",
+          "endpoint": "Oven address",
+          "verify_ssl": "Verify TLS certificate"
         },
-        "description": "Choose the defaults used when the oven is turned on from Home Assistant.",
+        "data_description": {
+          "ca_cert": "Paste your Project July ca.crt so Home Assistant trusts the oven's per-install certificate. Leave empty to use the system certificate store.",
+          "endpoint": "Hostname or IP address of an oven running the Project July local server, such as 192.168.1.75 or june-oven.local. Add a port if needed, or start with {http_prefix} to use the plain port-8080 listener. Leave empty to use June's cloud. Changing it reconnects to the same paired oven at its new address.",
+          "verify_ssl": "Turn off only if the oven's certificate cannot be trusted any other way. Commands stay signed, but the connection could be intercepted on your network."
+        },
+        "description": "Change the oven's address and the defaults used when the oven is turned on from Home Assistant.",
         "title": "June Oven options"
+      }
+    }
+  },
+  "selector": {
+    "cook_mode": {
+      "options": {
+        "airfry": "Air fry",
+        "bake": "Bake",
+        "broil": "Broil",
+        "roast": "Roast",
+        "toast": "Toast"
       }
     }
   }

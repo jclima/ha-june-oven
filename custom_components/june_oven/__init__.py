@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import logging
+import ssl
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import JuneClient, JuneError, JuneIdentity
-from .const import PLATFORMS
+from .api import JuneClient, JuneError, JuneIdentity, create_ssl_option
+from .const import CONF_CA_CERT, CONF_ENDPOINT, CONF_VERIFY_SSL, PLATFORMS
 from .coordinator import JuneDataUpdateCoordinator
+from .protocol import build_endpoints
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,6 +22,17 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up June Oven from a config entry."""
     identity = JuneIdentity.from_mapping(entry.data)
+    # Connection settings chosen during setup may be changed later in options.
+    config = {**entry.data, **entry.options}
+    try:
+        endpoints = build_endpoints(str(config.get(CONF_ENDPOINT, "")))
+        ssl_option = await hass.async_add_executor_job(
+            create_ssl_option,
+            bool(config.get(CONF_VERIFY_SSL, True)),
+            str(config.get(CONF_CA_CERT, "")),
+        )
+    except (ssl.SSLError, ValueError) as err:
+        raise ConfigEntryError(f"Invalid server settings: {err}") from err
 
     def save_tokens(updated: JuneIdentity) -> None:
         data: dict[str, Any] = {**entry.data, **updated.as_dict()}
@@ -28,6 +41,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     client = JuneClient(
         async_get_clientsession(hass),
         identity,
+        endpoints=endpoints,
+        ssl_option=ssl_option,
         token_callback=save_tokens,
     )
     coordinator = JuneDataUpdateCoordinator(hass, client)
